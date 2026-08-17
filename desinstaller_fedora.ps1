@@ -1,10 +1,10 @@
 # ============================================================
-#  OUTIL DE DESINSTALLATION DE FEDORA  (version 4)
+#  OUTIL DE DESINSTALLATION DE FEDORA  (version 5)
 #  ------------------------------------------------------------
-#  - Diagnostic complet avec GUID exact de chaque compartiment
-#  - Detection Linux fiable (GptType / MbrType)
-#  - Ne supprime QUE les partitions confirmees Linux (Fedora)
-#  - Ne touche JAMAIS a Windows, C:, ni a la partition de demarrage
+#  - Diagnostic complet avec GUID exact (corrige : accolades)
+#  - Detection Linux fiable (GptType / MbrType normalises)
+#  - Ne supprime QUE les partitions confirmees LINUX (Fedora)
+#  - Ne touche JAMAIS a Windows, C:, aux donnees (Y:) ni au demarrage
 #  - Repare le demarrage de Windows automatiquement
 #  - Journal : C:\desinstall_fedora_log.txt
 # ============================================================
@@ -26,7 +26,7 @@ function Alerte ($m) { Write-Host $m -ForegroundColor Yellow }
 function Erreur ($m) { Write-Host $m -ForegroundColor Red }
 function Succes ($m) { Write-Host $m -ForegroundColor Green }
 
-# GUID de partitions Linux (disques GPT)
+# GUID de partitions Linux (disques GPT) - en MAJUSCULES, sans accolades
 $guidsLinux = @(
     '0FC63DAF-8483-4772-8E79-3D69D8477DE4',  # Linux filesystem (ext4, xfs, btrfs)
     '0657FD6D-A4AB-43C4-84E5-0933C84B4F4F',  # Linux swap
@@ -44,16 +44,29 @@ $guidsLinux = @(
 # Types de partitions Linux (disques MBR)
 $typesLinuxMbr = @('0x82', '0x83', '0x8E', '0x8F')
 
+# --- Normalise un GUID (enleve accolades, met en majuscules) ---
+function Nettoyer-Guid($v) {
+    return "$v".Replace('{', '').Replace('}', '').ToUpper()
+}
+
+# --- Liste les partitions valides (sans les fantomes) ---
+function Get-Partitions-Valides {
+    $liste = @(Get-Partition -ErrorAction SilentlyContinue | Where-Object {
+        ($_.PartitionNumber -gt 0) -and ($_.Size -gt 0) -and ($_.GptType -or $_.MbrType)
+    })
+    return ,$liste
+}
+
 # --- Nom lisible du type de partition ---
 function Label-Type($p) {
-    $g = "$($p.GptType)"
+    $g = Nettoyer-Guid $p.GptType
     $m = "$($p.MbrType)"
     if ($g -ne '') {
         switch -wildcard ($g) {
-            'c12a7328*' { return 'EFI (demarrage)' }
-            'e3c9e316*' { return 'Reserve (MSR)' }
-            'ebd0a0a2*' { return 'Donnees Windows' }
-            'de94bba4*' { return 'Recuperation Windows' }
+            'C12A7328*' { return 'EFI (demarrage)' }
+            'E3C9E316*' { return 'Reserve (MSR)' }
+            'EBD0A0A2*' { return 'Donnees Windows' }
+            'DE94BBA4*' { return 'Recuperation Windows' }
             '0FC63DAF*' { return 'LINUX (Fedora)' }
             '0657FD6D*' { return 'LINUX swap' }
             'E6D6D379*' { return 'LINUX LVM' }
@@ -68,12 +81,12 @@ function Label-Type($p) {
             default { return 'Inconnu (' + $g + ')' }
         }
     } else {
-        switch ($m) {
-            '0x82' { return 'LINUX swap' }
-            '0x83' { return 'LINUX (Fedora)' }
-            '0x8E' { return 'LINUX LVM' }
-            '0x07' { return 'Donnees Windows (NTFS)' }
-            '0x0C' { return 'Donnees Windows (FAT32)' }
+        switch ($m.ToUpper()) {
+            '0X82' { return 'LINUX swap' }
+            '0X83' { return 'LINUX (Fedora)' }
+            '0X8E' { return 'LINUX LVM' }
+            '0X07' { return 'Donnees Windows (NTFS)' }
+            '0X0C' { return 'Donnees Windows (FAT32)' }
             default { return 'Inconnu (' + $m + ')' }
         }
     }
@@ -81,7 +94,7 @@ function Label-Type($p) {
 
 # --- Est-ce une partition Linux ? ---
 function Est-Linux($p) {
-    $g = "$($p.GptType)"
+    $g = Nettoyer-Guid $p.GptType
     $m = "$($p.MbrType)"
     foreach ($gid in $guidsLinux) {
         if (($g -eq $gid) -or ($g -like "$gid*")) { return $true }
@@ -104,7 +117,9 @@ function Afficher-Disques {
     foreach ($d in @(Get-Disk)) {
         $etat = if ($d.IsOffline) { "ENDORMI (hors ligne)" } else { "en ligne" }
         Ecrire ("  Disque {0} : {1} Go au total - {2} - style {3} - {4}" -f $d.Number, [math]::Round($d.Size / 1GB, 1), $d.FriendlyName, $d.PartitionStyle, $etat)
-        foreach ($p in @(Get-Partition -DiskNumber $d.Number -ErrorAction SilentlyContinue)) {
+        foreach ($p in @(Get-Partition -DiskNumber $d.Number -ErrorAction SilentlyContinue | Where-Object {
+            ($_.PartitionNumber -gt 0) -and ($_.Size -gt 0) -and ($_.GptType -or $_.MbrType)
+        })) {
             $gb = [math]::Round($p.Size / 1GB, 2)
             $info = ''
             if ($p.DriveLetter) {
@@ -118,12 +133,11 @@ function Afficher-Disques {
     Ecrire ""
 }
 
-# --- Analyse : chercher les partitions Linux (sans les fantomes) ---
+# --- Analyse : chercher les partitions Linux ---
 function Analyser {
-    $toutes = @(Get-Partition -ErrorAction SilentlyContinue)
+    $toutes = Get-Partitions-Valides
     $trouves = @()
     foreach ($p in $toutes) {
-        if ((-not $p.PartitionNumber) -or ($p.Size -le 0)) { continue }
         if (Est-Linux $p) {
             if ($p.IsSystem -or $p.IsBoot -or $p.IsActive) {
                 Alerte ("  - Partition Linux protegee ignoree (disque {0}, part. {1}) : securite" -f $p.DiskNumber, $p.PartitionNumber)
@@ -153,10 +167,9 @@ function Supprimer-Fedora($candidats) {
     Ecrire ""
     Ecrire "Autres partitions (Windows, demarrage, donnees...) :"
     Ecrire "---------------------------------------------------"
-    $toutes = @(Get-Partition -ErrorAction SilentlyContinue)
+    $toutes = Get-Partitions-Valides
     foreach ($p in $toutes) {
         if ($candidats -notcontains $p) {
-            if ((-not $p.PartitionNumber) -or ($p.Size -le 0)) { continue }
             $gb = [math]::Round($p.Size / 1GB, 1)
             $info = ''
             if ($p.DriveLetter) {
@@ -212,6 +225,7 @@ function Supprimer-Fedora($candidats) {
     Ecrire "Reparation du demarrage Windows..."
     $firmware = (Get-CimInstance -ClassName Win32_ComputerSystem).FirmwareType
     $sys = $env:SystemDrive
+    $toutes = Get-Partitions-Valides
 
     if ($firmware -eq 2) {
         Ecrire "  Mode detecte : UEFI"
@@ -220,9 +234,9 @@ function Supprimer-Fedora($candidats) {
             Succes "  - Sauvegarde du demarrage : C:\bcd_backup.bcd"
         } catch { Alerte "  - Sauvegarde du demarrage impossible (pas bloquant)" }
 
-        $esp = $toutes | Where-Object { ($_.GptType -like 'c12a7328*') -and (-not $_.DriveLetter) } | Select-Object -First 1
+        $esp = $toutes | Where-Object { (Nettoyer-Guid $_.GptType) -like 'C12A7328*' } | Select-Object -First 1
         if ($esp) {
-            $lettresPrises = @(Get-Partition | Where-Object { $_.DriveLetter } | ForEach-Object { "$($_.DriveLetter)" })
+            $lettresPrises = @(Get-Partitions-Valides | Where-Object { $_.DriveLetter } | ForEach-Object { "$($_.DriveLetter)" })
             $lettre = $null
             foreach ($l in @('Z','Y','X','W','V','U','T','S','R','Q','P','N','M','L','K','J','H','G','F','E','D')) {
                 if ($lettresPrises -notcontains $l) { $lettre = $l; break }
