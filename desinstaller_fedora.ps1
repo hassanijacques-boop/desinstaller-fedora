@@ -1,6 +1,7 @@
 # ============================================================
-#  OUTIL DE DESINSTALLATION DE FEDORA  (double demarrage)
+#  OUTIL DE DESINSTALLATION DE FEDORA  (version 2)
 #  ------------------------------------------------------------
+#  - Analyse TOUS les disques, meme ceux "endormis" (hors ligne)
 #  - Supprime UNIQUEMENT les partitions Linux (Fedora)
 #  - Ne touche JAMAIS a Windows, a C: ni a la partition de demarrage
 #  - Repare le demarrage de Windows automatiquement
@@ -54,12 +55,190 @@ function Est-Linux($p) {
     return $false
 }
 
+# --- Diagnostic complet des disques ---
+function Diagnostic-Disques {
+    Ecrire ""
+    Ecrire "DIAGNOSTIC COMPLET DES DISQUES :"
+    Ecrire "--------------------------------"
+    foreach ($d in @(Get-Disk)) {
+        $etat = if ($d.IsOffline) { "ENDORMI (hors ligne)" } else { "en ligne" }
+        Ecrire ("  Disque {0} : {1} Go - {2} - style {3} - {4}" -f $d.Number, [math]::Round($d.Size / 1GB, 1), $d.FriendlyName, $d.PartitionStyle, $etat)
+        foreach ($p in @(Get-Partition -DiskNumber $d.Number -ErrorAction SilentlyContinue)) {
+            $gb = [math]::Round($p.Size / 1GB, 1)
+            $lettre = ''
+            if ($p.DriveLetter) { $lettre = " (lettre $($p.DriveLetter))" }
+            Ecrire ("      * compartiment {0} : {1} Go - type {2}{3}" -f $p.PartitionNumber, $gb, $p.Type, $lettre)
+        }
+    }
+    Ecrire ""
+}
+
+# --- Analyse : chercher les partitions Linux ---
+function Analyser {
+    $toutes = @(Get-Partition -ErrorAction SilentlyContinue)
+    $trouves = @()
+    foreach ($p in $toutes) {
+        if (Est-Linux $p) {
+            $protegee = ($p.IsSystem -or $p.IsBoot -or $p.IsActive -or $p.DriveLetter)
+            if ($protegee) {
+                Alerte ("  - Partition Linux protegee ignoree (disque {0}, part. {1}) : securite" -f $p.DiskNumber, $p.PartitionNumber)
+            } else {
+                $trouves += $p
+            }
+        }
+    }
+    return ,$trouves
+}
+
+# --- Suppression + reparation + recuperation d'espace ---
+function Supprimer-Fedora($candidats) {
+    Ecrire ""
+    Ecrire "Partitions Fedora/Linux trouvees (a SUPPRIMER) :"
+    Ecrire "------------------------------------------------"
+    foreach ($c in $candidats) {
+        $gb = [math]::Round($c.Size / 1GB, 1)
+        Ecrire ("  - Disque {0}, compartiment n°{1} : {2} Go" -f $c.DiskNumber, $c.PartitionNumber, $gb)
+    }
+    Ecrire ""
+    Ecrire "Autres partitions (Windows, demarrage, ...) :"
+    Ecrire "---------------------------------------------"
+    $toutes = @(Get-Partition -ErrorAction SilentlyContinue)
+    foreach ($p in $toutes) {
+        if ($candidats -notcontains $p) {
+            $gb = [math]::Round($p.Size / 1GB, 1)
+            $lettre = ''
+            if ($p.DriveLetter) { $lettre = " (lettre $($p.DriveLetter))" }
+            Ecrire ("  - Disque {0}, compartiment n°{1} : {2} Go{3}" -f $p.DiskNumber, $p.PartitionNumber, $gb, $lettre)
+        }
+    }
+
+    Ecrire ""
+    Alerte "Verifie que la liste a SUPPRIMER correspond bien a Fedora"
+    Alerte "(les gros compartiments sans lettre). Si quelque chose semble"
+    Alerte "anormal, tape autre chose que OUI : l'outil ne fera rien."
+    Ecrire ""
+    $confirmation = Read-Host "Tape OUI (en majuscules) pour SUPPRIMER ces compartiments"
+    if ($confirmation -ne 'OUI') {
+        Erreur "Operation annulee. Aucune modification n'a ete faite."
+        Read-Host "Appuie sur Entree pour fermer"
+        exit 0
+    }
+
+    # --- Suppression ---
+    Ecrire ""
+    Ecrire "Suppression des compartiments Fedora..."
+    $echecs = 0
+    foreach ($c in $candidats) {
+        try {
+            Remove-Partition -DiskNumber $c.DiskNumber -PartitionNumber $c.PartitionNumber -Confirm:$false -ErrorAction Stop
+            Succes ("  - Supprime : disque {0}, compartiment n°{1}" -f $c.DiskNumber, $c.PartitionNumber)
+        } catch {
+            Erreur ("  - ECHEC disque {0}, compartiment n°{1} : {2}" -f $c.DiskNumber, $c.PartitionNumber, $_.Exception.Message)
+            $echecs++
+        }
+    }
+    if ($echecs -gt 0) {
+        Erreur ""
+        Erreur "Certaines partitions n'ont pas pu etre supprimees."
+        Erreur "Relance l'outil apres redemarrage du PC."
+    }
+
+    # --- Reparation du demarrage ---
+    Ecrire ""
+    Ecrire "Reparation du demarrage Windows..."
+    $firmware = (Get-CimInstance -ClassName Win32_ComputerSystem).FirmwareType
+    $sys = $env:SystemDrive
+
+    if ($firmware -eq 2) {
+        Ecrire "  Mode detecte : UEFI"
+        try {
+            bcdedit /export C:\bcd_backup.bcd | Out-Null
+            Succes "  - Sauvegarde du demarrage : C:\bcd_backup.bcd"
+        } catch { Alerte "  - Sauvegarde du demarrage impossible (pas bloquant)" }
+
+        $esp = $toutes | Where-Object { ($_.Type -eq 'c12a7328-f81f-11d2-ba4b-00a0c93ec93b') -and (-not $_.DriveLetter) } | Select-Object -First 1
+        if ($esp) {
+            $lettresPrises = @(Get-Partition | Where-Object { $_.DriveLetter } | ForEach-Object { "$($_.DriveLetter)" })
+            $lettre = $null
+            foreach ($l in @('Z','Y','X','W','V','U','T','S','R','Q','P','N','M','L','K','J','H','G','F','E','D')) {
+                if ($lettresPrises -notcontains $l) { $lettre = $l; break }
+            }
+            if ($lettre) {
+                try {
+                    Set-Partition -DiskNumber $esp.DiskNumber -PartitionNumber $esp.PartitionNumber -NewDriveLetter $lettre -ErrorAction Stop
+                    $esp2 = Get-Partition -DiskNumber $esp.DiskNumber -PartitionNumber $esp.PartitionNumber
+                    $chemin = $lettre + ':\'
+                    bcdboot "$sys\Windows" /s $chemin /f UEFI | Out-Null
+                    Succes "  - Demarrage Windows reconstruit"
+                    try { Remove-PartitionAccessPath -DiskNumber $esp.DiskNumber -PartitionNumber $esp.PartitionNumber -AccessPath $chemin -ErrorAction SilentlyContinue } catch {}
+                } catch {
+                    Erreur "  - Echec de la reparation : $($_.Exception.Message)"
+                }
+            } else {
+                Erreur "  - Aucune lettre libre pour reparer le demarrage"
+            }
+        } else {
+            Erreur "  - Partition de demarrage EFI introuvable"
+        }
+        try {
+            bcdedit /set '{fwbootmgr}' displayorder '{bootmgr}' /addfirst | Out-Null
+            Succes "  - Windows demarrera en priorite"
+        } catch { Alerte "  - Reordonnancement du demarrage impossible (a faire dans le BIOS si besoin)" }
+    } else {
+        Ecrire "  Mode detecte : BIOS (ancien)"
+        try {
+            bootrec /fixmbr | Out-Null
+            if ($LASTEXITCODE -eq 0) { Succes "  - Boot principal reecrit" } else { Erreur "  - Echec bootrec /fixmbr" }
+        } catch { Erreur "  - Echec bootrec /fixmbr" }
+        try {
+            bootrec /fixboot | Out-Null
+            if ($LASTEXITCODE -eq 0) { Succes "  - Boot de Windows reecrit" } else { Erreur "  - Echec bootrec /fixboot" }
+        } catch { Erreur "  - Echec bootrec /fixboot" }
+    }
+
+    # --- Recuperation de l'espace libere ---
+    Ecrire ""
+    $reponse = Read-Host "Veux-tu recuperer l'espace libere pour Windows ? (OUI/NON)"
+    if ($reponse -eq 'OUI') {
+        Ecrire "Recuperation de l'espace..."
+        $pC = Get-Partition -DriveLetter C
+        try {
+            $tailleMax = (Get-PartitionSupportedSize -DriveLetter C).SizeMax
+            if ($tailleMax -gt $pC.Size) {
+                Resize-Partition -DriveLetter C -Size $tailleMax -ErrorAction Stop
+                $nouvelle = Get-Partition -DriveLetter C
+                Succes ("  - C: agrandi : maintenant {0} Go" -f [math]::Round($nouvelle.Size / 1GB, 1))
+            } else {
+                Alerte "  - C: ne peut pas etre agrandi (l'espace libere est sur un autre disque)"
+            }
+        } catch {
+            Erreur "  - Impossible d'agrandir C: : $($_.Exception.Message)"
+        }
+        foreach ($disque in @(Get-Disk)) {
+            $tailleLibre = $disque.Size - $disque.AllocatedSize
+            if ($tailleLibre -gt 5GB) {
+                try {
+                    $np = New-Partition -DiskNumber $disque.Number -UseMaximumSize -AssignDriveLetter -ErrorAction Stop
+                    Format-Volume -Partition $np -FileSystem NTFS -Confirm:$false -ErrorAction Stop | Out-Null
+                    Succes ("  - Nouveau compartiment cree : {0} Go (lettre {1})" -f [math]::Round($tailleLibre / 1GB, 1), $np.DriveLetter)
+                } catch {
+                    Erreur "  - Impossible de creer un nouveau compartiment : $($_.Exception.Message)"
+                }
+            }
+        }
+    }
+}
+
+# ============================================================
+#  FLUX PRINCIPAL
+# ============================================================
+
 Ecrire "============================================================"
 Ecrire "  OUTIL DE DESINSTALLATION DE FEDORA"
 Ecrire "============================================================"
 Ecrire ""
 Ecrire "Cet outil va :"
-Ecrire "  1. Chercher les compartiments Fedora (Linux) de ton disque"
+Ecrire "  1. Chercher les compartiments Fedora (Linux) de TON PC"
 Ecrire "  2. Te les montrer pour confirmation"
 Ecrire "  3. Les supprimer"
 Ecrire "  4. Reparer le demarrage de Windows"
@@ -78,165 +257,72 @@ if (-not $partC) {
     exit 1
 }
 
-# --- Analyse des partitions ---
+# --- Premiere analyse ---
 Ecrire "Analyse des disques en cours..."
-$toutes = @(Get-Partition -ErrorAction SilentlyContinue)
-$candidats = @()
-foreach ($p in $toutes) {
-    if (Est-Linux $p) {
-        $protegee = ($p.IsSystem -or $p.IsBoot -or $p.IsActive -or $p.DriveLetter)
-        if ($protegee) {
-            Alerte ("  - Partition Linux protegee ignoree (disque {0}, part. {1}) : securite" -f $p.DiskNumber, $p.PartitionNumber)
-        } else {
-            $candidats += $p
-        }
-    }
-}
+$candidats = @(Analyser)
 
 if ($candidats.Count -eq 0) {
-    Erreur ""
-    Erreur "Aucune partition Fedora/Linux trouvee sur ce PC."
-    Erreur "Rien a supprimer."
-    Read-Host "Appuie sur Entree pour fermer"
-    exit 1
-}
+    # Rien trouve : diagnostic complet
+    Alerte ""
+    Alerte "Aucune partition Fedora visible pour l'instant."
+    Alerte "Peut-etre que le disque Fedora est endormi (hors ligne)."
+    Diagnostic-Disques
 
-# --- Affichage des partitions ---
-Ecrire ""
-Ecrire "Partitions Fedora/Linux trouvees (a SUPPRIMER) :"
-Ecrire "------------------------------------------------"
-foreach ($c in $candidats) {
-    $gb = [math]::Round($c.Size / 1GB, 1)
-    Ecrire ("  - Disque {0}, compartiment n°{1} : {2} Go" -f $c.DiskNumber, $c.PartitionNumber, $gb)
-}
-Ecrire ""
-Ecrire "Autres partitions (Windows, demarrage, ...) :"
-Ecrire "---------------------------------------------"
-foreach ($p in $toutes) {
-    if ($candidats -notcontains $p) {
-        $gb = [math]::Round($p.Size / 1GB, 1)
-        $lettre = ''
-        if ($p.DriveLetter) { $lettre = " (lettre $($p.DriveLetter))" }
-        Ecrire ("  - Disque {0}, compartiment n°{1} : {2} Go{3}" -f $p.DiskNumber, $p.PartitionNumber, $gb, $lettre)
-    }
-}
-
-Ecrire ""
-Alerte "Verifie que la liste a SUPPRIMER correspond bien a Fedora"
-Alerte "(les gros compartiments sans lettre). Si quelque chose semble"
-Alerte "anormal, tape autre chose que OUI : l'outil ne fera rien."
-Ecrire ""
-$confirmation = Read-Host "Tape OUI (en majuscules) pour SUPPRIMER ces compartiments"
-if ($confirmation -ne 'OUI') {
-    Erreur "Operation annulee. Aucune modification n'a ete faite."
-    Read-Host "Appuie sur Entree pour fermer"
-    exit 0
-}
-
-# --- Suppression ---
-Ecrire ""
-Ecrire "Suppression des compartiments Fedora..."
-$echecs = 0
-foreach ($c in $candidats) {
-    try {
-        Remove-Partition -DiskNumber $c.DiskNumber -PartitionNumber $c.PartitionNumber -Confirm:$false -ErrorAction Stop
-        Succes ("  - Supprime : disque {0}, compartiment n°{1}" -f $c.DiskNumber, $c.PartitionNumber)
-    } catch {
-        Erreur ("  - ECHEC disque {0}, compartiment n°{1} : {2}" -f $c.DiskNumber, $c.PartitionNumber, $_.Exception.Message)
-        $echecs++
-    }
-}
-if ($echecs -gt 0) {
-    Erreur ""
-    Erreur "Certaines partitions n'ont pas pu etre supprimees."
-    Erreur "Relance l'outil apres redemarrage du PC."
-}
-
-# --- Reparation du demarrage ---
-Ecrire ""
-Ecrire "Reparation du demarrage Windows..."
-$firmware = (Get-CimInstance -ClassName Win32_ComputerSystem).FirmwareType
-$sys = $env:SystemDrive
-
-if ($firmware -eq 2) {
-    # Mode UEFI
-    Ecrire "  Mode detecte : UEFI"
-    try {
-        bcdedit /export C:\bcd_backup.bcd | Out-Null
-        Succes "  - Sauvegarde du demarrage : C:\bcd_backup.bcd"
-    } catch { Alerte "  - Sauvegarde du demarrage impossible (pas bloquant)" }
-
-    $esp = $toutes | Where-Object { ($_.Type -eq 'c12a7328-f81f-11d2-ba4b-00a0c93ec93b') -and (-not $_.DriveLetter) } | Select-Object -First 1
-    if ($esp) {
-        $lettresPrises = @(Get-Partition | Where-Object { $_.DriveLetter } | ForEach-Object { "$($_.DriveLetter)" })
-        $lettre = $null
-        foreach ($l in @('Z','Y','X','W','V','U','T','S','R','Q','P','N','M','L','K','J','H','G','F','E','D')) {
-            if ($lettresPrises -notcontains $l) { $lettre = $l; break }
+    # Reveiller les disques endormis
+    $offlines = @(Get-Disk | Where-Object { $_.IsOffline })
+    if ($offlines.Count -gt 0) {
+        Ecrire ""
+        Ecrire ("{0} disque(s) endormi(s) trouve(s) :" -f $offlines.Count)
+        foreach ($d in $offlines) {
+            Ecrire ("  - Disque {0} : {1}" -f $d.Number, $d.FriendlyName)
         }
-        if ($lettre) {
-            try {
-                Set-Partition -DiskNumber $esp.DiskNumber -PartitionNumber $esp.PartitionNumber -NewDriveLetter $lettre -ErrorAction Stop
-                $esp2 = Get-Partition -DiskNumber $esp.DiskNumber -PartitionNumber $esp.PartitionNumber
-                $chemin = $lettre + ':\'
-                bcdboot "$sys\Windows" /s $chemin /f UEFI | Out-Null
-                Succes "  - Demarrage Windows reconstruit"
-                try { Remove-PartitionAccessPath -DiskNumber $esp.DiskNumber -PartitionNumber $esp.PartitionNumber -AccessPath $chemin -ErrorAction SilentlyContinue } catch {}
-            } catch {
-                Erreur "  - Echec de la reparation : $($_.Exception.Message)"
+        $rep = Read-Host "Veux-tu que je reveille ce(s) disque(s) pour les analyser ? (OUI/NON)"
+        if ($rep -eq 'OUI') {
+            foreach ($d in $offlines) {
+                try {
+                    Set-Disk -Number $d.Number -IsOffline $false -ErrorAction Stop
+                    Succes ("  - Disque {0} reveille" -f $d.Number)
+                } catch {
+                    Erreur ("  - Echec du reveil du disque {0} : {1}" -f $d.Number, $_.Exception.Message)
+                }
             }
-        } else {
-            Erreur "  - Aucune lettre libre pour reparer le demarrage"
+            Start-Sleep -Seconds 3
+            Ecrire ""
+            Ecrire "Re-analyse apres reveil..."
+            $candidats = @(Analyser)
+            if ($candidats.Count -gt 0) {
+                Succes "Fedora a ete trouve !"
+            } else {
+                Alerte "Toujours aucune partition Fedora trouvee."
+            }
         }
     } else {
-        Erreur "  - Partition de demarrage EFI introuvable"
+        Alerte "Aucun disque endormi. Fedora n'est pas visible par Windows."
     }
-    try {
-        bcdedit /set '{fwbootmgr}' displayorder '{bootmgr}' /addfirst | Out-Null
-        Succes "  - Windows demarrera en priorite"
-    } catch { Alerte "  - Reordonnancement du demarrage impossible (a faire dans le BIOS si besoin)" }
-} else {
-    # Mode BIOS (ancien)
-    Ecrire "  Mode detecte : BIOS (ancien)"
-    try {
-        bootrec /fixmbr | Out-Null
-        if ($LASTEXITCODE -eq 0) { Succes "  - Boot principal reecrit" } else { Erreur "  - Echec bootrec /fixmbr" }
-    } catch { Erreur "  - Echec bootrec /fixmbr" }
-    try {
-        bootrec /fixboot | Out-Null
-        if ($LASTEXITCODE -eq 0) { Succes "  - Boot de Windows reecrit" } else { Erreur "  - Echec bootrec /fixboot" }
-    } catch { Erreur "  - Echec bootrec /fixboot" }
 }
 
-# --- Recuperation de l'espace libere ---
-Ecrire ""
-$reponse = Read-Host "Veux-tu recuperer l'espace libere pour Windows ? (OUI/NON)"
-if ($reponse -eq 'OUI') {
-    Ecrire "Recuperation de l'espace..."
-    $pC = Get-Partition -DriveLetter C
-    try {
-        $tailleMax = (Get-PartitionSupportedSize -DriveLetter C).SizeMax
-        if ($tailleMax -gt $pC.Size) {
-            Resize-Partition -DriveLetter C -Size $tailleMax -ErrorAction Stop
-            $nouvelle = Get-Partition -DriveLetter C
-            Succes ("  - C: agrandi : maintenant {0} Go" -f [math]::Round($nouvelle.Size / 1GB, 1))
-        } else {
-            Alerte "  - C: ne peut pas etre agrandi (l'espace libere n'est pas juste a cote)"
-        }
-    } catch {
-        Erreur "  - Impossible d'agrandir C: : $($_.Exception.Message)"
-    }
-    foreach ($disque in @(Get-Disk)) {
-        $tailleLibre = $disque.Size - $disque.AllocatedSize
-        if ($tailleLibre -gt 5GB) {
-            try {
-                $np = New-Partition -DiskNumber $disque.Number -UseMaximumSize -AssignDriveLetter -ErrorAction Stop
-                Format-Volume -Partition $np -FileSystem NTFS -Confirm:$false -ErrorAction Stop | Out-Null
-                Succes ("  - Nouveau compartiment cree : {0} Go (lettre {1})" -f [math]::Round($tailleLibre / 1GB, 1), $np.DriveLetter)
-            } catch {
-                Erreur "  - Impossible de creer un nouveau compartiment : $($_.Exception.Message)"
-            }
-        }
-    }
+if ($candidats.Count -gt 0) {
+    Supprimer-Fedora $candidats
+} else {
+    Erreur ""
+    Erreur "============================================================"
+    Erreur "  FEDORA N'A PAS ETE TROUVE SUR LES DISQUES"
+    Erreur "============================================================"
+    Erreur ""
+    Erreur "Windows ne voit pas de disque Fedora. Possibilites :"
+    Erreur "  1. Le disque Fedora n'est pas branche/visible"
+    Erreur "  2. Fedora est sur un disque gere par le BIOS uniquement"
+    Erreur ""
+    Erreur "Regarde le diagnostic ci-dessus : si tu vois un disque sans"
+    Erreur "compartiment ni lettre, c'est peut-etre lui."
+    Erreur ""
+    Erreur "Autre solution simple : dans le BIOS (F2/F10/Suppr au"
+    Erreur "demarrage), tu peux desactiver l'entree Fedora ou mettre"
+    Erreur "le disque Windows en premier dans l'ordre de demarrage."
+    Ecrire ""
+    Ecrire "Decris ce que tu vois dans le diagnostic (ou envoie une"
+    Ecrire "photo) et on trouvera la solution."
+    Read-Host "Appuie sur Entree pour fermer"
 }
 
 # --- Fin ---
@@ -247,6 +333,11 @@ Succes "============================================================"
 Ecrire ""
 Ecrire "Redemarre maintenant ton PC : Windows doit demarrer"
 Ecrire "directement, sans le menu Fedora."
+Ecrire ""
+Ecrire "Si le PC affiche encore un menu au demarrage : choisis"
+Ecrire "Windows. Pour enlever l'entree Fedora du menu, va dans"
+Ecrire "le BIOS (F2/F10/Suppr) et mets Windows Boot Manager"
+Ecrire "(ou le disque Windows) en premier."
 Ecrire ""
 Ecrire "Journal complet : C:\desinstall_fedora_log.txt"
 Ecrire "Sauvegarde du demarrage : C:\bcd_backup.bcd"
