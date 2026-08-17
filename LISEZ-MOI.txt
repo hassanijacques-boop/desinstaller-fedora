@@ -1,0 +1,39 @@
+============================================================
+  COMMENT DESINSTALLER FEDORA DE TON PC (mode d'emploi)
+============================================================
+
+Tu as 3 fichiers dans ce dossier :
+  1. desinstaller_fedora.bat   <- celui qu'il faut LANCER
+  2. desinstaller_fedora.ps1   <- le moteur (ne pas toucher)
+  3. ce fichier (LISEZ-MOI)
+
+ETAPES :
+
+  1. Avant de commencer : sauvegarde tes documents importants
+     (photos, fichiers) sur une cle USB ou dans le cloud, par
+     securite.
+
+  2. Clic DROIT sur "desinstaller_fedora.bat" puis choisis
+     "Executer en tant qu'administrateur".
+
+  3. Une fenetre bleue/grise s'ouvre. Lis ce qu'elle affiche :
+     elle va te montrer les compartiments Fedora trouves.
+
+  4. Verifie la liste. Si tout semble normal, tape OUI (en
+     majuscules) puis Entree. L'outil supprime Fedora et
+     repare le demarrage de Windows tout seul.
+
+  5. A la fin, il te demande si tu veux recuperer l'espace
+     pour Windows : tape OUI puis Entree.
+
+  6. Redemarre ton PC. Windows doit demarrer directement,
+     sans le menu Fedora.
+
+IMPORTANT :
+  - Cet outil ne supprime JAMAIS Windows, C:, ni la partition
+    de demarrage. Seules les partitions Linux (Fedora) sont
+    supprimees.
+  - Si quelque chose semble bizarre a l'ecran, tape n'importe
+    quoi d'autre que OUI : l'outil s'arrete sans rien modifier.
+  - Journal de tout ce qui a ete fait : C:\desinstall_fedora_log.txt
+  - Sauvegarde du demarrage : C:\bcd_backup.bcd
