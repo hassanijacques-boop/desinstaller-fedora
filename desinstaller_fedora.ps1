@@ -1,10 +1,10 @@
 # ============================================================
-#  OUTIL DE DESINSTALLATION DE FEDORA  (version 3)
+#  OUTIL DE DESINSTALLATION DE FEDORA  (version 4)
 #  ------------------------------------------------------------
-#  - Diagnostic complet : TOUS les disques, TOUS les types
-#  - Reveille les disques endormis (hors ligne)
-#  - Supprime UNIQUEMENT les partitions Linux (Fedora) confirmees
-#  - Ne touche JAMAIS a Windows, C: ni a la partition de demarrage
+#  - Diagnostic complet avec GUID exact de chaque compartiment
+#  - Detection Linux fiable (GptType / MbrType)
+#  - Ne supprime QUE les partitions confirmees Linux (Fedora)
+#  - Ne touche JAMAIS a Windows, C:, ni a la partition de demarrage
 #  - Repare le demarrage de Windows automatiquement
 #  - Journal : C:\desinstall_fedora_log.txt
 # ============================================================
@@ -44,20 +44,60 @@ $guidsLinux = @(
 # Types de partitions Linux (disques MBR)
 $typesLinuxMbr = @('0x82', '0x83', '0x8E', '0x8F')
 
+# --- Nom lisible du type de partition ---
+function Label-Type($p) {
+    $g = "$($p.GptType)"
+    $m = "$($p.MbrType)"
+    if ($g -ne '') {
+        switch -wildcard ($g) {
+            'c12a7328*' { return 'EFI (demarrage)' }
+            'e3c9e316*' { return 'Reserve (MSR)' }
+            'ebd0a0a2*' { return 'Donnees Windows' }
+            'de94bba4*' { return 'Recuperation Windows' }
+            '0FC63DAF*' { return 'LINUX (Fedora)' }
+            '0657FD6D*' { return 'LINUX swap' }
+            'E6D6D379*' { return 'LINUX LVM' }
+            'A19D880F*' { return 'LINUX RAID' }
+            '933AC7E1*' { return 'LINUX /home' }
+            '3B8F8425*' { return 'LINUX /boot' }
+            '4F68BCE3*' { return 'LINUX racine btrfs' }
+            '4D21B016*' { return 'LINUX racine' }
+            '44479540*' { return 'LINUX racine' }
+            '5DFBF5F4*' { return 'LINUX /srv' }
+            'BC13C2FF*' { return 'LINUX /usr' }
+            default { return 'Inconnu (' + $g + ')' }
+        }
+    } else {
+        switch ($m) {
+            '0x82' { return 'LINUX swap' }
+            '0x83' { return 'LINUX (Fedora)' }
+            '0x8E' { return 'LINUX LVM' }
+            '0x07' { return 'Donnees Windows (NTFS)' }
+            '0x0C' { return 'Donnees Windows (FAT32)' }
+            default { return 'Inconnu (' + $m + ')' }
+        }
+    }
+}
+
+# --- Est-ce une partition Linux ? ---
 function Est-Linux($p) {
-    $t = "$($p.Type)"
-    if ($t -eq '') { return $false }
-    foreach ($g in $guidsLinux) {
-        if (($t -eq $g) -or ($t -like "*$g*")) { return $true }
+    $g = "$($p.GptType)"
+    $m = "$($p.MbrType)"
+    foreach ($gid in $guidsLinux) {
+        if (($g -eq $gid) -or ($g -like "$gid*")) { return $true }
     }
     foreach ($x in $typesLinuxMbr) {
-        if (($t -eq $x) -or ($t -like "*$x*")) { return $true }
+        if (($m -eq $x) -or ($m -like "*$x*")) { return $true }
     }
     return $false
 }
 
 # --- Diagnostic complet : tous les disques et leurs types ---
 function Afficher-Disques {
+    $vols = @{}
+    foreach ($v in @(Get-Volume -ErrorAction SilentlyContinue)) {
+        if ($v.DriveLetter) { $vols["$($v.DriveLetter)"] = "$($v.FileSystem)" }
+    }
     Ecrire ""
     Ecrire "DIAGNOSTIC COMPLET (tous les disques et compartiments) :"
     Ecrire "--------------------------------------------------------"
@@ -66,9 +106,13 @@ function Afficher-Disques {
         Ecrire ("  Disque {0} : {1} Go au total - {2} - style {3} - {4}" -f $d.Number, [math]::Round($d.Size / 1GB, 1), $d.FriendlyName, $d.PartitionStyle, $etat)
         foreach ($p in @(Get-Partition -DiskNumber $d.Number -ErrorAction SilentlyContinue)) {
             $gb = [math]::Round($p.Size / 1GB, 2)
-            $lettre = ''
-            if ($p.DriveLetter) { $lettre = " (lettre $($p.DriveLetter))" }
-            Ecrire ("      * compartiment {0} : {1} Go - type {2}{3}" -f $p.PartitionNumber, $gb, $p.Type, $lettre)
+            $info = ''
+            if ($p.DriveLetter) {
+                $fs = $vols["$($p.DriveLetter)"]
+                if (-not $fs) { $fs = '?' }
+                $info = " (lettre $($p.DriveLetter), systeme : $fs)"
+            }
+            Ecrire ("      * compartiment {0} : {1} Go - {2}{3}" -f $p.PartitionNumber, $gb, (Label-Type $p), $info)
         }
     }
     Ecrire ""
@@ -79,7 +123,7 @@ function Analyser {
     $toutes = @(Get-Partition -ErrorAction SilentlyContinue)
     $trouves = @()
     foreach ($p in $toutes) {
-        if (($p.DiskNumber -eq $null) -or ($p.Size -le 0)) { continue }
+        if ((-not $p.PartitionNumber) -or ($p.Size -le 0)) { continue }
         if (Est-Linux $p) {
             if ($p.IsSystem -or $p.IsBoot -or $p.IsActive) {
                 Alerte ("  - Partition Linux protegee ignoree (disque {0}, part. {1}) : securite" -f $p.DiskNumber, $p.PartitionNumber)
@@ -93,33 +137,41 @@ function Analyser {
 
 # --- Suppression + reparation + recuperation d'espace ---
 function Supprimer-Fedora($candidats) {
+    $vols = @{}
+    foreach ($v in @(Get-Volume -ErrorAction SilentlyContinue)) {
+        if ($v.DriveLetter) { $vols["$($v.DriveLetter)"] = "$($v.FileSystem)" }
+    }
     Ecrire ""
     Ecrire "Partitions Fedora/Linux trouvees (a SUPPRIMER) :"
     Ecrire "------------------------------------------------"
     foreach ($c in $candidats) {
         $gb = [math]::Round($c.Size / 1GB, 1)
-        $lettre = ''
-        if ($c.DriveLetter) { $lettre = " (lettre $($c.DriveLetter) - sera retiree)" }
-        Ecrire ("  - Disque {0}, compartiment n°{1} : {2} Go - type {3}{4}" -f $c.DiskNumber, $c.PartitionNumber, $gb, $c.Type, $lettre)
+        $info = ''
+        if ($c.DriveLetter) { $info = " (lettre $($c.DriveLetter) - sera retiree)" }
+        Ecrire ("  - Disque {0}, compartiment n°{1} : {2} Go - {3}{4}" -f $c.DiskNumber, $c.PartitionNumber, $gb, (Label-Type $c), $info)
     }
     Ecrire ""
-    Ecrire "Autres partitions (Windows, demarrage, ...) :"
-    Ecrire "---------------------------------------------"
+    Ecrire "Autres partitions (Windows, demarrage, donnees...) :"
+    Ecrire "---------------------------------------------------"
     $toutes = @(Get-Partition -ErrorAction SilentlyContinue)
     foreach ($p in $toutes) {
         if ($candidats -notcontains $p) {
-            if (($p.DiskNumber -eq $null) -or ($p.Size -le 0)) { continue }
+            if ((-not $p.PartitionNumber) -or ($p.Size -le 0)) { continue }
             $gb = [math]::Round($p.Size / 1GB, 1)
-            $lettre = ''
-            if ($p.DriveLetter) { $lettre = " (lettre $($p.DriveLetter))" }
-            Ecrire ("  - Disque {0}, compartiment n°{1} : {2} Go - type {3}{4}" -f $p.DiskNumber, $p.PartitionNumber, $gb, $p.Type, $lettre)
+            $info = ''
+            if ($p.DriveLetter) {
+                $fs = $vols["$($p.DriveLetter)"]
+                if (-not $fs) { $fs = '?' }
+                $info = " (lettre $($p.DriveLetter), systeme : $fs)"
+            }
+            Ecrire ("  - Disque {0}, compartiment n°{1} : {2} Go - {3}{4}" -f $p.DiskNumber, $p.PartitionNumber, $gb, (Label-Type $p), $info)
         }
     }
 
     Ecrire ""
-    Alerte "Verifie que la liste a SUPPRIMER correspond bien a Fedora"
-    Alerte "(type commencant par Linux ou 0x8). Si quelque chose semble"
-    Alerte "anormal, tape autre chose que OUI : l'outil ne fera rien."
+    Alerte "Verifie que la liste a SUPPRIMER ne contient QUE des"
+    Alerte "partitions marquees LINUX. Les partitions Windows et"
+    Alerte "donnees ne sont JAMAIS dans cette liste."
     Ecrire ""
     $confirmation = Read-Host "Tape OUI (en majuscules) pour SUPPRIMER ces compartiments"
     if ($confirmation -ne 'OUI') {
@@ -133,7 +185,6 @@ function Supprimer-Fedora($candidats) {
     Ecrire "Suppression des compartiments Fedora..."
     $echecs = 0
     foreach ($c in $candidats) {
-        # Retirer la lettre si une partition Linux en avait une
         if ($c.DriveLetter) {
             try {
                 Remove-PartitionAccessPath -DiskNumber $c.DiskNumber -PartitionNumber $c.PartitionNumber -AccessPath ($c.DriveLetter.ToString() + ':\') -ErrorAction Stop
@@ -169,7 +220,7 @@ function Supprimer-Fedora($candidats) {
             Succes "  - Sauvegarde du demarrage : C:\bcd_backup.bcd"
         } catch { Alerte "  - Sauvegarde du demarrage impossible (pas bloquant)" }
 
-        $esp = $toutes | Where-Object { ($_.Type -eq 'c12a7328-f81f-11d2-ba4b-00a0c93ec93b') -and (-not $_.DriveLetter) } | Select-Object -First 1
+        $esp = $toutes | Where-Object { ($_.GptType -like 'c12a7328*') -and (-not $_.DriveLetter) } | Select-Object -First 1
         if ($esp) {
             $lettresPrises = @(Get-Partition | Where-Object { $_.DriveLetter } | ForEach-Object { "$($_.DriveLetter)" })
             $lettre = $null
@@ -221,7 +272,7 @@ function Supprimer-Fedora($candidats) {
                 $nouvelle = Get-Partition -DriveLetter C
                 Succes ("  - C: agrandi : maintenant {0} Go" -f [math]::Round($nouvelle.Size / 1GB, 1))
             } else {
-                Alerte "  - C: ne peut pas etre agrandi (l'espace libere est sur un autre disque)"
+                Alerte "  - C: ne peut pas etre agrandi (l'espace libere n'est pas juste a cote)"
             }
         } catch {
             Erreur "  - Impossible d'agrandir C: : $($_.Exception.Message)"
@@ -250,14 +301,13 @@ Ecrire "  OUTIL DE DESINSTALLATION DE FEDORA"
 Ecrire "============================================================"
 Ecrire ""
 Ecrire "Cet outil va :"
-Ecrire "  1. Afficher TOUS tes disques et leurs types"
-Ecrire "  2. Reveiller le disque Fedora s'il est endormi"
-Ecrire "  3. Te montrer les compartiments Fedora a supprimer"
-Ecrire "  4. Les supprimer et reparer le demarrage de Windows"
+Ecrire "  1. Afficher TOUS tes disques avec leurs vrais types"
+Ecrire "  2. Te montrer les compartiments LINUX (Fedora) a supprimer"
+Ecrire "  3. Les supprimer et reparer le demarrage de Windows"
 Ecrire ""
-Alerte "SECURITE : Windows (C:), la partition de demarrage et la"
-Alerte "partition de recuperation ne seront JAMAIS touchees."
-Alerte "Seules les partitions de type Linux (Fedora) sont visees."
+Alerte "SECURITE : Windows (C:), la partition de demarrage, la"
+Alerte "recuperation et les donnees (Y:) ne seront JAMAIS touchees."
+Alerte "Seules les partitions marquees LINUX sont visees."
 Ecrire ""
 
 # --- Verification de base : Windows doit etre sur C: ---
@@ -308,7 +358,7 @@ if ($candidats.Count -gt 0) {
 } else {
     Erreur ""
     Erreur "============================================================"
-    Erreur "  AUCUNE PARTITION FEDORA CONFIRMEE"
+    Erreur "  AUCUNE PARTITION LINUX CONFIRMEE"
     Erreur "============================================================"
     Erreur ""
     Erreur "Le diagnostic complet est affiche ci-dessus."
