@@ -1,9 +1,10 @@
 # ============================================================
-#  OUTIL DE DESINSTALLATION DE FEDORA  (version 2)
+#  OUTIL DE DESINSTALLATION DE FEDORA  (version 3)
 #  ------------------------------------------------------------
-#  - Analyse TOUS les disques, meme ceux "endormis" (hors ligne)
-#  - Supprime UNIQUEMENT les partitions Linux (Fedora)
-#  - Ne touche JAMAIS a Windows, a C: ni a la partition de demarrage
+#  - Diagnostic complet : TOUS les disques, TOUS les types
+#  - Reveille les disques endormis (hors ligne)
+#  - Supprime UNIQUEMENT les partitions Linux (Fedora) confirmees
+#  - Ne touche JAMAIS a Windows, C: ni a la partition de demarrage
 #  - Repare le demarrage de Windows automatiquement
 #  - Journal : C:\desinstall_fedora_log.txt
 # ============================================================
@@ -55,16 +56,16 @@ function Est-Linux($p) {
     return $false
 }
 
-# --- Diagnostic complet des disques ---
-function Diagnostic-Disques {
+# --- Diagnostic complet : tous les disques et leurs types ---
+function Afficher-Disques {
     Ecrire ""
-    Ecrire "DIAGNOSTIC COMPLET DES DISQUES :"
-    Ecrire "--------------------------------"
+    Ecrire "DIAGNOSTIC COMPLET (tous les disques et compartiments) :"
+    Ecrire "--------------------------------------------------------"
     foreach ($d in @(Get-Disk)) {
         $etat = if ($d.IsOffline) { "ENDORMI (hors ligne)" } else { "en ligne" }
-        Ecrire ("  Disque {0} : {1} Go - {2} - style {3} - {4}" -f $d.Number, [math]::Round($d.Size / 1GB, 1), $d.FriendlyName, $d.PartitionStyle, $etat)
+        Ecrire ("  Disque {0} : {1} Go au total - {2} - style {3} - {4}" -f $d.Number, [math]::Round($d.Size / 1GB, 1), $d.FriendlyName, $d.PartitionStyle, $etat)
         foreach ($p in @(Get-Partition -DiskNumber $d.Number -ErrorAction SilentlyContinue)) {
-            $gb = [math]::Round($p.Size / 1GB, 1)
+            $gb = [math]::Round($p.Size / 1GB, 2)
             $lettre = ''
             if ($p.DriveLetter) { $lettre = " (lettre $($p.DriveLetter))" }
             Ecrire ("      * compartiment {0} : {1} Go - type {2}{3}" -f $p.PartitionNumber, $gb, $p.Type, $lettre)
@@ -73,14 +74,14 @@ function Diagnostic-Disques {
     Ecrire ""
 }
 
-# --- Analyse : chercher les partitions Linux ---
+# --- Analyse : chercher les partitions Linux (sans les fantomes) ---
 function Analyser {
     $toutes = @(Get-Partition -ErrorAction SilentlyContinue)
     $trouves = @()
     foreach ($p in $toutes) {
+        if (($p.DiskNumber -eq $null) -or ($p.Size -le 0)) { continue }
         if (Est-Linux $p) {
-            $protegee = ($p.IsSystem -or $p.IsBoot -or $p.IsActive -or $p.DriveLetter)
-            if ($protegee) {
+            if ($p.IsSystem -or $p.IsBoot -or $p.IsActive) {
                 Alerte ("  - Partition Linux protegee ignoree (disque {0}, part. {1}) : securite" -f $p.DiskNumber, $p.PartitionNumber)
             } else {
                 $trouves += $p
@@ -97,7 +98,9 @@ function Supprimer-Fedora($candidats) {
     Ecrire "------------------------------------------------"
     foreach ($c in $candidats) {
         $gb = [math]::Round($c.Size / 1GB, 1)
-        Ecrire ("  - Disque {0}, compartiment n°{1} : {2} Go" -f $c.DiskNumber, $c.PartitionNumber, $gb)
+        $lettre = ''
+        if ($c.DriveLetter) { $lettre = " (lettre $($c.DriveLetter) - sera retiree)" }
+        Ecrire ("  - Disque {0}, compartiment n°{1} : {2} Go - type {3}{4}" -f $c.DiskNumber, $c.PartitionNumber, $gb, $c.Type, $lettre)
     }
     Ecrire ""
     Ecrire "Autres partitions (Windows, demarrage, ...) :"
@@ -105,16 +108,17 @@ function Supprimer-Fedora($candidats) {
     $toutes = @(Get-Partition -ErrorAction SilentlyContinue)
     foreach ($p in $toutes) {
         if ($candidats -notcontains $p) {
+            if (($p.DiskNumber -eq $null) -or ($p.Size -le 0)) { continue }
             $gb = [math]::Round($p.Size / 1GB, 1)
             $lettre = ''
             if ($p.DriveLetter) { $lettre = " (lettre $($p.DriveLetter))" }
-            Ecrire ("  - Disque {0}, compartiment n°{1} : {2} Go{3}" -f $p.DiskNumber, $p.PartitionNumber, $gb, $lettre)
+            Ecrire ("  - Disque {0}, compartiment n°{1} : {2} Go - type {3}{4}" -f $p.DiskNumber, $p.PartitionNumber, $gb, $p.Type, $lettre)
         }
     }
 
     Ecrire ""
     Alerte "Verifie que la liste a SUPPRIMER correspond bien a Fedora"
-    Alerte "(les gros compartiments sans lettre). Si quelque chose semble"
+    Alerte "(type commencant par Linux ou 0x8). Si quelque chose semble"
     Alerte "anormal, tape autre chose que OUI : l'outil ne fera rien."
     Ecrire ""
     $confirmation = Read-Host "Tape OUI (en majuscules) pour SUPPRIMER ces compartiments"
@@ -129,6 +133,15 @@ function Supprimer-Fedora($candidats) {
     Ecrire "Suppression des compartiments Fedora..."
     $echecs = 0
     foreach ($c in $candidats) {
+        # Retirer la lettre si une partition Linux en avait une
+        if ($c.DriveLetter) {
+            try {
+                Remove-PartitionAccessPath -DiskNumber $c.DiskNumber -PartitionNumber $c.PartitionNumber -AccessPath ($c.DriveLetter.ToString() + ':\') -ErrorAction Stop
+                Succes ("  - Lettre {0} retiree du compartiment {1}" -f $c.DriveLetter, $c.PartitionNumber)
+            } catch {
+                Alerte ("  - Impossible de retirer la lettre {0} (continue quand meme)" -f $c.DriveLetter)
+            }
+        }
         try {
             Remove-Partition -DiskNumber $c.DiskNumber -PartitionNumber $c.PartitionNumber -Confirm:$false -ErrorAction Stop
             Succes ("  - Supprime : disque {0}, compartiment n°{1}" -f $c.DiskNumber, $c.PartitionNumber)
@@ -166,7 +179,6 @@ function Supprimer-Fedora($candidats) {
             if ($lettre) {
                 try {
                     Set-Partition -DiskNumber $esp.DiskNumber -PartitionNumber $esp.PartitionNumber -NewDriveLetter $lettre -ErrorAction Stop
-                    $esp2 = Get-Partition -DiskNumber $esp.DiskNumber -PartitionNumber $esp.PartitionNumber
                     $chemin = $lettre + ':\'
                     bcdboot "$sys\Windows" /s $chemin /f UEFI | Out-Null
                     Succes "  - Demarrage Windows reconstruit"
@@ -238,10 +250,10 @@ Ecrire "  OUTIL DE DESINSTALLATION DE FEDORA"
 Ecrire "============================================================"
 Ecrire ""
 Ecrire "Cet outil va :"
-Ecrire "  1. Chercher les compartiments Fedora (Linux) de TON PC"
-Ecrire "  2. Te les montrer pour confirmation"
-Ecrire "  3. Les supprimer"
-Ecrire "  4. Reparer le demarrage de Windows"
+Ecrire "  1. Afficher TOUS tes disques et leurs types"
+Ecrire "  2. Reveiller le disque Fedora s'il est endormi"
+Ecrire "  3. Te montrer les compartiments Fedora a supprimer"
+Ecrire "  4. Les supprimer et reparer le demarrage de Windows"
 Ecrire ""
 Alerte "SECURITE : Windows (C:), la partition de demarrage et la"
 Alerte "partition de recuperation ne seront JAMAIS touchees."
@@ -257,72 +269,56 @@ if (-not $partC) {
     exit 1
 }
 
-# --- Premiere analyse ---
+# --- Diagnostic complet (toujours affiche) ---
 Ecrire "Analyse des disques en cours..."
-$candidats = @(Analyser)
+Afficher-Disques
 
-if ($candidats.Count -eq 0) {
-    # Rien trouve : diagnostic complet
-    Alerte ""
-    Alerte "Aucune partition Fedora visible pour l'instant."
-    Alerte "Peut-etre que le disque Fedora est endormi (hors ligne)."
-    Diagnostic-Disques
-
-    # Reveiller les disques endormis
-    $offlines = @(Get-Disk | Where-Object { $_.IsOffline })
-    if ($offlines.Count -gt 0) {
-        Ecrire ""
-        Ecrire ("{0} disque(s) endormi(s) trouve(s) :" -f $offlines.Count)
+# --- Reveiller les disques endormis ---
+$offlines = @(Get-Disk | Where-Object { $_.IsOffline })
+if ($offlines.Count -gt 0) {
+    Ecrire ""
+    Ecrire ("{0} disque(s) endormi(s) trouve(s) :" -f $offlines.Count)
+    foreach ($d in $offlines) {
+        Ecrire ("  - Disque {0} : {1}" -f $d.Number, $d.FriendlyName)
+    }
+    $rep = Read-Host "Veux-tu que je reveille ce(s) disque(s) pour les analyser ? (OUI/NON)"
+    if ($rep -eq 'OUI') {
         foreach ($d in $offlines) {
-            Ecrire ("  - Disque {0} : {1}" -f $d.Number, $d.FriendlyName)
-        }
-        $rep = Read-Host "Veux-tu que je reveille ce(s) disque(s) pour les analyser ? (OUI/NON)"
-        if ($rep -eq 'OUI') {
-            foreach ($d in $offlines) {
-                try {
-                    Set-Disk -Number $d.Number -IsOffline $false -ErrorAction Stop
-                    Succes ("  - Disque {0} reveille" -f $d.Number)
-                } catch {
-                    Erreur ("  - Echec du reveil du disque {0} : {1}" -f $d.Number, $_.Exception.Message)
-                }
-            }
-            Start-Sleep -Seconds 3
-            Ecrire ""
-            Ecrire "Re-analyse apres reveil..."
-            $candidats = @(Analyser)
-            if ($candidats.Count -gt 0) {
-                Succes "Fedora a ete trouve !"
-            } else {
-                Alerte "Toujours aucune partition Fedora trouvee."
+            try {
+                Set-Disk -Number $d.Number -IsOffline $false -ErrorAction Stop
+                Succes ("  - Disque {0} reveille" -f $d.Number)
+            } catch {
+                Erreur ("  - Echec du reveil du disque {0} : {1}" -f $d.Number, $_.Exception.Message)
             }
         }
+        Start-Sleep -Seconds 3
+        Ecrire ""
+        Ecrire "Re-analyse apres reveil..."
+        Afficher-Disques
     } else {
-        Alerte "Aucun disque endormi. Fedora n'est pas visible par Windows."
+        Alerte "Disques endormis ignores."
     }
 }
+
+# --- Analyse finale ---
+$candidats = @(Analyser)
 
 if ($candidats.Count -gt 0) {
     Supprimer-Fedora $candidats
 } else {
     Erreur ""
     Erreur "============================================================"
-    Erreur "  FEDORA N'A PAS ETE TROUVE SUR LES DISQUES"
+    Erreur "  AUCUNE PARTITION FEDORA CONFIRMEE"
     Erreur "============================================================"
     Erreur ""
-    Erreur "Windows ne voit pas de disque Fedora. Possibilites :"
-    Erreur "  1. Le disque Fedora n'est pas branche/visible"
-    Erreur "  2. Fedora est sur un disque gere par le BIOS uniquement"
+    Erreur "Le diagnostic complet est affiche ci-dessus."
+    Erreur "Selectionne tout le texte (clic gauche, glisser) puis"
+    Erreur "appuie sur Entree pour le copier, et envoie-le a"
+    Erreur "l'assistant : il decidera quoi faire en toute securite."
     Erreur ""
-    Erreur "Regarde le diagnostic ci-dessus : si tu vois un disque sans"
-    Erreur "compartiment ni lettre, c'est peut-etre lui."
-    Erreur ""
-    Erreur "Autre solution simple : dans le BIOS (F2/F10/Suppr au"
-    Erreur "demarrage), tu peux desactiver l'entree Fedora ou mettre"
-    Erreur "le disque Windows en premier dans l'ordre de demarrage."
-    Ecrire ""
-    Ecrire "Decris ce que tu vois dans le diagnostic (ou envoie une"
-    Ecrire "photo) et on trouvera la solution."
+    Erreur "Le journal est aussi dans : C:\desinstall_fedora_log.txt"
     Read-Host "Appuie sur Entree pour fermer"
+    exit 1
 }
 
 # --- Fin ---
