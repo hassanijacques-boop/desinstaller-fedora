@@ -1,5 +1,5 @@
 # ============================================================
-#  OUTIL DE DESINSTALLATION DE FEDORA  (version 5)
+#  OUTIL DE DESINSTALLATION DE FEDORA  (version 6)
 #  ------------------------------------------------------------
 #  - Diagnostic complet avec GUID exact (corrige : accolades)
 #  - Detection Linux fiable (GptType / MbrType normalises)
@@ -365,7 +365,7 @@ if ($offlines.Count -gt 0) {
 }
 
 # --- Analyse finale ---
-$candidats = @(Analyser)
+$candidats = Analyser
 
 if ($candidats.Count -gt 0) {
     Supprimer-Fedora $candidats
